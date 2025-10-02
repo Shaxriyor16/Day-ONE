@@ -1,148 +1,149 @@
 import os
-import sqlite3
-from datetime import time, datetime
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    ConversationHandler,
     filters,
 )
+from datetime import time
 
-# --- MA'LUMOTLAR BAZASI ---
-DB_FILE = "tasks.db"
+# States
+ASK_TASK_NAME, ASK_HOUR, ASK_MINUTE = range(3)
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            chat_id INTEGER,
-            task TEXT,
-            PRIMARY KEY(chat_id, task)
-        )
-    """)
-    conn.commit()
-    conn.close()
+# Foydalanuvchilar ishlarini saqlash
+user_tasks = {}
 
-def add_task_db(chat_id: int, task: str):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO tasks(chat_id, task) VALUES (?, ?)", (chat_id, task))
-    conn.commit()
-    conn.close()
-
-def remove_task_db(chat_id: int, index: int) -> str:
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT task FROM tasks WHERE chat_id=? ORDER BY rowid", (chat_id,))
-    rows = cursor.fetchall()
-    if 0 <= index < len(rows):
-        task = rows[index][0]
-        cursor.execute("DELETE FROM tasks WHERE chat_id=? AND task=?", (chat_id, task))
-        conn.commit()
-        conn.close()
-        return task
-    conn.close()
-    return None
-
-def list_tasks_db(chat_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT task FROM tasks WHERE chat_id=? ORDER BY rowid", (chat_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    return [r[0] for r in rows]
-
-# --- KOMANDALAR ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# /add bosilganda ish nomi so'raladi
+async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Assalomu alaykum! 👋\n"
-        "Men sizning kundalik eslatma botingizman.\n\n"
-        "Buyruqlar:\n"
-        "/add <ish> – yangi ish qo‘shish\n"
-        "/remove <raqam> – ro‘yxatdan ishni o‘chirish\n"
-        "/list – barcha ishlarni ko‘rish\n"
-        "/remind – har kuni eslatma o‘rnatish"
+        "📝 Iltimos ish nomini kiriting (bo‘sh qoldirish mumkin):"
+    )
+    return ASK_TASK_NAME
+
+# Ish nomini olamiz, soatni so'raymiz
+async def ask_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task_name = update.message.text.strip() or "Ishingiz"
+    context.user_data["task_name"] = task_name
+    await update.message.reply_text("⏰ Eslatma yuboriladigan soatni kiriting (0-23):")
+    return ASK_HOUR
+
+# Soatni olamiz, daqiqani so'raymiz
+async def ask_minute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        hour = int(update.message.text.strip())
+        if not (0 <= hour <= 23):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Iltimos, 0 dan 23 gacha bo‘lgan raqam kiriting.")
+        return ASK_HOUR
+    context.user_data["task_hour"] = hour
+    await update.message.reply_text("⏰ Eslatma yuboriladigan daqiqani kiriting (0-59):")
+    return ASK_MINUTE
+
+# Daqiqani olamiz va ishni saqlaymiz
+async def set_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    try:
+        minute = int(update.message.text.strip())
+        if not (0 <= minute <= 59):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Iltimos, 0 dan 59 gacha bo‘lgan raqam kiriting.")
+        return ASK_MINUTE
+
+    task_name = context.user_data["task_name"]
+    hour = context.user_data["task_hour"]
+
+    if user_id not in user_tasks:
+        user_tasks[user_id] = []
+
+    job = context.job_queue.run_daily(
+        daily_reminder, time(hour=hour, minute=minute), chat_id=user_id, name=f"{user_id}_{task_name}"
     )
 
-async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    task = " ".join(context.args)
-    if not task:
-        await update.message.reply_text("❗ Foydalanish: /add <ish>")
-        return
-    add_task_db(update.effective_chat.id, task)
-    await update.message.reply_text(f"✅ Ish qo‘shildi: {task}")
+    user_tasks[user_id].append({"name": task_name, "hour": hour, "minute": minute, "job": job})
 
+    await update.message.reply_text(f"✅ Ish qo‘shildi: {task_name}\n⏰ Eslatma vaqti: {hour:02d}:{minute:02d}")
+    return ConversationHandler.END
+
+# Har kuni eslatma yuborish
+async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    await context.bot.send_message(chat_id, "⏰ Esingizda bo‘lsin, bugun ishlaringiz bor!")
+
+# Ishlar ro‘yxati
+async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    tasks = user_tasks.get(user_id, [])
+    if not tasks:
+        await update.message.reply_text("📭 Sizda hali hech qanday ish yo‘q.")
+        return
+    msg = "📋 Kundalik ishlaringiz:\n"
+    for i, t in enumerate(tasks, start=1):
+        msg += f"{i}. {t['name']} – {t['hour']:02d}:{t['minute']:02d}\n"
+    await update.message.reply_text(msg)
+
+# Ishni o‘chirish
 async def remove_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
     if not context.args:
         await update.message.reply_text("❗ Foydalanish: /remove <raqam>")
         return
     try:
         index = int(context.args[0]) - 1
-        removed = remove_task_db(update.effective_chat.id, index)
-        if removed:
-            await update.message.reply_text(f"❌ O‘chirildi: {removed}")
+        tasks = user_tasks.get(user_id, [])
+        if 0 <= index < len(tasks):
+            removed = tasks.pop(index)
+            if removed["job"]:
+                removed["job"].schedule_removal()
+            await update.message.reply_text(f"❌ O‘chirildi: {removed['name']}")
         else:
             await update.message.reply_text("❗ Noto‘g‘ri raqam kiritildi.")
     except ValueError:
         await update.message.reply_text("❗ Raqamni to‘g‘ri kiriting.")
 
-async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tasks = list_tasks_db(update.effective_chat.id)
-    if not tasks:
-        await update.message.reply_text("📭 Sizda hali hech qanday ish yo‘q.")
-        return
-    msg = "📋 Kundalik ishlaringiz:\n"
-    for i, task in enumerate(tasks, start=1):
-        msg += f"{i}. {task}\n"
-    await update.message.reply_text(msg)
+# Bekor qilish
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Ish qo‘shish bekor qilindi.")
+    return ConversationHandler.END
 
-# --- HAR KUNI ESLATMA ---
-async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT chat_id FROM tasks")
-    chat_ids = [r[0] for r in cursor.fetchall()]
-    conn.close()
+# Start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Assalomu alaykum! 👋\n"
+        "Men sizning kundalik eslatma botingizman.\n\n"
+        "Buyruqlar:\n"
+        "/add – yangi ish qo‘shish\n"
+        "/remove <raqam> – ishni o‘chirish\n"
+        "/list – barcha ishlarni ko‘rish\n"
+        "/cancel – ish qo‘shishni bekor qilish"
+    )
 
-    for chat_id in chat_ids:
-        tasks = list_tasks_db(chat_id)
-        if tasks:
-            msg = "⏰ Bugungi ishlaringiz:\n" + "\n".join(f"{i+1}. {t}" for i, t in enumerate(tasks))
-        else:
-            msg = "📭 Sizda bugun hech qanday ish yo‘q."
-        await context.bot.send_message(chat_id, msg)
-
-async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    # Har kuni soat 9:00 da eslatma
-    context.job_queue.run_daily(daily_reminder, time(hour=9, minute=0), chat_id=chat_id)
-    await update.message.reply_text("✅ Har kuni soat 09:00 da eslatma yuboraman!")
-
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❓ Kechirasiz, bu komanda menga tushunarli emas.")
-
-# --- ASOSIY FUNKSIYA ---
 def main():
     TOKEN = os.getenv("TELEGRAM_TOKEN")
     if not TOKEN:
-        print("❗ TELEGRAM_TOKEN topilmadi.")
+        print("❗ TELEGRAM_TOKEN topilmadi. Environment Variables ga qo‘shing.")
         return
 
-    init_db()
     app = Application.builder().token(TOKEN).build()
 
-    # Komandalar
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add_task))
-    app.add_handler(CommandHandler("remove", remove_task))
-    app.add_handler(CommandHandler("list", list_tasks))
-    app.add_handler(CommandHandler("remind", set_reminder))
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("add", add_task_start)],
+        states={
+            ASK_TASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_hour)],
+            ASK_HOUR: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_minute)],
+            ASK_MINUTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_task)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
 
-    # Noma’lum komandalar
-    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("list", list_tasks))
+    app.add_handler(CommandHandler("remove", remove_task))
+    app.add_handler(conv_handler)
 
     print("🤖 Bot ishlayapti...")
     app.run_polling()
