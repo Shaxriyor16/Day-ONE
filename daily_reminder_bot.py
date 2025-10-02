@@ -18,14 +18,15 @@ user_tasks = {}
 
 # /add bosilganda ish nomi so'raladi
 async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📝 Iltimos ish nomini kiriting (bo‘sh qoldirish mumkin):"
-    )
+    await update.message.reply_text("📝 Iltimos ish nomini kiriting:")
     return ASK_TASK_NAME
 
 # Ish nomini olamiz, soatni so'raymiz
 async def ask_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    task_name = update.message.text.strip() or "Ishingiz"
+    task_name = update.message.text.strip()
+    if not task_name:
+        await update.message.reply_text("❌ Iltimos, ish nomini bo‘sh qoldirmang.")
+        return ASK_TASK_NAME
     context.user_data["task_name"] = task_name
     await update.message.reply_text("⏰ Eslatma yuboriladigan soatni kiriting (0-23):")
     return ASK_HOUR
